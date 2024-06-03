@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -17,8 +17,14 @@
 package server
 
 import (
+	"bytes"
+	"fmt"
+	"html/template"
+	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/http/pprof"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -26,12 +32,12 @@ import (
 	"time"
 
 	"github.com/88250/gulu"
-	"github.com/88250/melody"
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
-	"github.com/mssola/user_agent"
+	"github.com/mssola/useragent"
+	"github.com/olahol/melody"
 	"github.com/siyuan-note/logging"
 	"github.com/siyuan-note/siyuan/kernel/api"
 	"github.com/siyuan-note/siyuan/kernel/cmd"
@@ -44,10 +50,15 @@ var cookieStore = cookie.NewStore([]byte("ATN51UlxVq1Gcvdf"))
 func Serve(fastMode bool) {
 	gin.SetMode(gin.ReleaseMode)
 	ginServer := gin.New()
+	ginServer.UseH2C = true
 	ginServer.MaxMultipartMemory = 1024 * 1024 * 32 // 插入较大的资源文件时内存占用较大 https://github.com/siyuan-note/siyuan/issues/5023
-	ginServer.Use(gin.Recovery())
-	ginServer.Use(corsMiddleware()) // 后端服务支持 CORS 预检请求验证 https://github.com/siyuan-note/siyuan/pull/5593
-	ginServer.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedExtensions([]string{".pdf", ".mp3", ".wav", ".ogg", ".mov", ".weba", ".mkv", ".mp4", ".webm"})))
+	ginServer.Use(
+		model.ControlConcurrency, // 请求串行化 Concurrency control when requesting the kernel API https://github.com/siyuan-note/siyuan/issues/9939
+		model.Timing,
+		model.Recover,
+		corsMiddleware(), // 后端服务支持 CORS 预检请求验证 https://github.com/siyuan-note/siyuan/pull/5593
+		gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedExtensions([]string{".pdf", ".mp3", ".wav", ".ogg", ".mov", ".weba", ".mkv", ".mp4", ".webm"})),
+	)
 
 	cookieStore.Options(sessions.Options{
 		Path:   "/",
@@ -57,30 +68,105 @@ func Serve(fastMode bool) {
 	})
 	ginServer.Use(sessions.Sessions("siyuan", cookieStore))
 
-	if "dev" == util.Mode {
-		serveDebug(ginServer)
-	}
-
+	serveDebug(ginServer)
 	serveAssets(ginServer)
 	serveAppearance(ginServer)
 	serveWebSocket(ginServer)
 	serveExport(ginServer)
 	serveWidgets(ginServer)
+	servePlugins(ginServer)
 	serveEmojis(ginServer)
+	serveTemplates(ginServer)
+	servePublic(ginServer)
+	serveRepoDiff(ginServer)
 	api.ServeAPI(ginServer)
 
-	var addr string
-	if model.Conf.System.NetworkServe || "docker" == util.Container {
-		addr = "0.0.0.0:" + util.ServerPort
+	var host string
+	if model.Conf.System.NetworkServe || util.ContainerDocker == util.Container {
+		host = "0.0.0.0"
 	} else {
-		addr = "127.0.0.1:" + util.ServerPort
+		host = "127.0.0.1"
 	}
-	logging.LogInfof("kernel is booting [%s]", "http://"+addr)
-	util.HttpServing = true
-	if err := ginServer.Run(addr); nil != err {
+
+	ln, err := net.Listen("tcp", host+":"+util.ServerPort)
+	if nil != err {
 		if !fastMode {
 			logging.LogErrorf("boot kernel failed: %s", err)
-			os.Exit(util.ExitCodeUnavailablePort)
+			os.Exit(logging.ExitCodeUnavailablePort)
+		}
+
+		// fast 模式下启动失败则直接返回
+		return
+	}
+
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if nil != err {
+		if !fastMode {
+			logging.LogErrorf("boot kernel failed: %s", err)
+			os.Exit(logging.ExitCodeUnavailablePort)
+		}
+	}
+	util.ServerPort = port
+
+	pid := fmt.Sprintf("%d", os.Getpid())
+	if !fastMode {
+		rewritePortJSON(pid, port)
+	}
+
+	logging.LogInfof("kernel [pid=%s] http server [%s] is booting", pid, host+":"+port)
+	util.HttpServing = true
+
+	go func() {
+		time.Sleep(1 * time.Second)
+		if util.FixedPort != port {
+			if isPortOpen(util.FixedPort) {
+				return
+			}
+
+			// 启动一个 6806 端口的反向代理服务器，这样浏览器扩展才能直接使用 127.0.0.1:6806，不用配置端口
+			serverURL, _ := url.Parse("http://127.0.0.1:" + port)
+			proxy := httputil.NewSingleHostReverseProxy(serverURL)
+			logging.LogInfof("reverse proxy server [%s] is booting", host+":"+util.FixedPort)
+			if proxyErr := http.ListenAndServe(host+":"+util.FixedPort, proxy); nil != proxyErr {
+				logging.LogWarnf("boot reverse proxy server [%s] failed: %s", serverURL, proxyErr)
+			}
+			// 反代服务器启动失败不影响核心服务器启动
+		}
+	}()
+
+	go util.HookUILoaded()
+
+	if err = http.Serve(ln, ginServer.Handler()); nil != err {
+		if !fastMode {
+			logging.LogErrorf("boot kernel failed: %s", err)
+			os.Exit(logging.ExitCodeUnavailablePort)
+		}
+	}
+}
+
+func rewritePortJSON(pid, port string) {
+	portJSON := filepath.Join(util.HomeDir, ".config", "siyuan", "port.json")
+	pidPorts := map[string]string{}
+	var data []byte
+	var err error
+
+	if gulu.File.IsExist(portJSON) {
+		data, err = os.ReadFile(portJSON)
+		if nil != err {
+			logging.LogWarnf("read port.json failed: %s", err)
+		} else {
+			if err = gulu.JSON.UnmarshalJSON(data, &pidPorts); nil != err {
+				logging.LogWarnf("unmarshal port.json failed: %s", err)
+			}
+		}
+	}
+
+	pidPorts[pid] = port
+	if data, err = gulu.JSON.MarshalIndentJSON(pidPorts, "", "  "); nil != err {
+		logging.LogWarnf("marshal port.json failed: %s", err)
+	} else {
+		if err = os.WriteFile(portJSON, data, 0644); nil != err {
+			logging.LogWarnf("write port.json failed: %s", err)
 		}
 	}
 }
@@ -93,27 +179,59 @@ func serveWidgets(ginServer *gin.Engine) {
 	ginServer.Static("/widgets/", filepath.Join(util.DataDir, "widgets"))
 }
 
+func servePlugins(ginServer *gin.Engine) {
+	ginServer.Static("/plugins/", filepath.Join(util.DataDir, "plugins"))
+}
+
 func serveEmojis(ginServer *gin.Engine) {
 	ginServer.Static("/emojis/", filepath.Join(util.DataDir, "emojis"))
 }
 
+func serveTemplates(ginServer *gin.Engine) {
+	ginServer.Static("/templates/", filepath.Join(util.DataDir, "templates"))
+}
+
+func servePublic(ginServer *gin.Engine) {
+	// Support directly access `data/public/*` contents via URL link https://github.com/siyuan-note/siyuan/issues/8593
+	ginServer.Static("/public/", filepath.Join(util.DataDir, "public"))
+}
+
 func serveAppearance(ginServer *gin.Engine) {
+	ginServer.StaticFile("favicon.ico", filepath.Join(util.WorkingDir, "stage", "icon.png"))
+	ginServer.StaticFile("manifest.json", filepath.Join(util.WorkingDir, "stage", "manifest.webmanifest"))
+	ginServer.StaticFile("manifest.webmanifest", filepath.Join(util.WorkingDir, "stage", "manifest.webmanifest"))
+
 	siyuan := ginServer.Group("", model.CheckAuth)
 
 	siyuan.Handle("GET", "/", func(c *gin.Context) {
 		userAgentHeader := c.GetHeader("User-Agent")
+		logging.LogInfof("serving [/] for user-agent [%s]", userAgentHeader)
+
+		// Carry query parameters when redirecting
+		location := url.URL{}
+		queryParams := c.Request.URL.Query()
+		queryParams.Set("r", gulu.Rand.String(7))
+		location.RawQuery = queryParams.Encode()
+
 		if strings.Contains(userAgentHeader, "Electron") {
-			c.Redirect(302, "/stage/build/app/?r="+gulu.Rand.String(7))
-			return
+			location.Path = "/stage/build/app/"
+		} else if strings.Contains(userAgentHeader, "Pad") ||
+			(strings.ContainsAny(userAgentHeader, "Android") && !strings.Contains(userAgentHeader, "Mobile")) {
+			// Improve detecting Pad device, treat it as desktop device https://github.com/siyuan-note/siyuan/issues/8435 https://github.com/siyuan-note/siyuan/issues/8497
+			location.Path = "/stage/build/desktop/"
+		} else {
+			if idx := strings.Index(userAgentHeader, "Mozilla/"); 0 < idx {
+				userAgentHeader = userAgentHeader[idx:]
+			}
+			ua := useragent.New(userAgentHeader)
+			if ua.Mobile() {
+				location.Path = "/stage/build/mobile/"
+			} else {
+				location.Path = "/stage/build/desktop/"
+			}
 		}
 
-		ua := user_agent.New(userAgentHeader)
-		if ua.Mobile() {
-			c.Redirect(302, "/stage/build/mobile/?r="+gulu.Rand.String(7))
-			return
-		}
-
-		c.Redirect(302, "/stage/build/desktop/?r="+gulu.Rand.String(7))
+		c.Redirect(302, location.String())
 	})
 
 	appearancePath := util.AppearancePath
@@ -137,12 +255,14 @@ func serveAppearance(ginServer *gin.Engine) {
 				enUSFilePath := filepath.Join(appearancePath, "langs", "en_US.json")
 				enUSData, err := os.ReadFile(enUSFilePath)
 				if nil != err {
-					logging.LogFatalf("read en_US.json [%s] failed: %s", enUSFilePath, err)
+					logging.LogErrorf("read en_US.json [%s] failed: %s", enUSFilePath, err)
+					util.ReportFileSysFatalError(err)
 					return
 				}
 				enUSMap := map[string]interface{}{}
 				if err = gulu.JSON.UnmarshalJSON(enUSData, &enUSMap); nil != err {
-					logging.LogFatalf("unmarshal en_US.json [%s] failed: %s", enUSFilePath, err)
+					logging.LogErrorf("unmarshal en_US.json [%s] failed: %s", enUSFilePath, err)
+					util.ReportFileSysFatalError(err)
 					return
 				}
 
@@ -175,7 +295,7 @@ func serveAppearance(ginServer *gin.Engine) {
 	})
 
 	siyuan.Static("/stage/", filepath.Join(util.WorkingDir, "stage"))
-	siyuan.StaticFile("favicon.ico", filepath.Join(util.WorkingDir, "stage", "icon.png"))
+	ginServer.StaticFile("service-worker.js", filepath.Join(util.WorkingDir, "stage", "service-worker.js"))
 
 	siyuan.GET("/check-auth", serveCheckAuth)
 }
@@ -187,6 +307,58 @@ func serveCheckAuth(c *gin.Context) {
 		c.Status(500)
 		return
 	}
+
+	tpl, err := template.New("auth").Parse(string(data))
+	if nil != err {
+		logging.LogErrorf("parse auth page failed: %s", err)
+		c.Status(500)
+		return
+	}
+
+	keymapHideWindow := "⌥M"
+	if nil != (*model.Conf.Keymap)["general"] {
+		switch (*model.Conf.Keymap)["general"].(type) {
+		case map[string]interface{}:
+			keymapGeneral := (*model.Conf.Keymap)["general"].(map[string]interface{})
+			if nil != keymapGeneral["toggleWin"] {
+				switch keymapGeneral["toggleWin"].(type) {
+				case map[string]interface{}:
+					toggleWin := keymapGeneral["toggleWin"].(map[string]interface{})
+					if nil != toggleWin["custom"] {
+						keymapHideWindow = toggleWin["custom"].(string)
+					}
+				}
+			}
+		}
+		if "" == keymapHideWindow {
+			keymapHideWindow = "⌥M"
+		}
+	}
+	model := map[string]interface{}{
+		"l0":                     model.Conf.Language(173),
+		"l1":                     model.Conf.Language(174),
+		"l2":                     template.HTML(model.Conf.Language(172)),
+		"l3":                     model.Conf.Language(175),
+		"l4":                     model.Conf.Language(176),
+		"l5":                     model.Conf.Language(177),
+		"l6":                     model.Conf.Language(178),
+		"l7":                     template.HTML(model.Conf.Language(184)),
+		"l8":                     model.Conf.Language(95),
+		"appearanceMode":         model.Conf.Appearance.Mode,
+		"appearanceModeOS":       model.Conf.Appearance.ModeOS,
+		"workspace":              filepath.Base(util.WorkspaceDir),
+		"workspacePath":          util.WorkspaceDir,
+		"keymapGeneralToggleWin": keymapHideWindow,
+		"trayMenuLangs":          util.TrayMenuLangs[util.Lang],
+		"workspaceDir":           util.WorkspaceDir,
+	}
+	buf := &bytes.Buffer{}
+	if err = tpl.Execute(buf, model); nil != err {
+		logging.LogErrorf("execute auth page failed: %s", err)
+		c.Status(500)
+		return
+	}
+	data = buf.Bytes()
 	c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 }
 
@@ -204,17 +376,28 @@ func serveAssets(ginServer *gin.Engine) {
 		http.ServeFile(context.Writer, context.Request, p)
 		return
 	})
-	ginServer.GET("/history/:dir/assets/*name", model.CheckAuth, func(context *gin.Context) {
-		dir := context.Param("dir")
-		name := context.Param("name")
-		relativePath := path.Join(dir, "assets", name)
-		p := filepath.Join(util.HistoryDir, relativePath)
+	ginServer.GET("/history/*path", model.CheckAuth, func(context *gin.Context) {
+		p := filepath.Join(util.HistoryDir, context.Param("path"))
+		http.ServeFile(context.Writer, context.Request, p)
+		return
+	})
+}
+
+func serveRepoDiff(ginServer *gin.Engine) {
+	ginServer.GET("/repo/diff/*path", model.CheckAuth, func(context *gin.Context) {
+		requestPath := context.Param("path")
+		p := filepath.Join(util.TempDir, "repo", "diff", requestPath)
 		http.ServeFile(context.Writer, context.Request, p)
 		return
 	})
 }
 
 func serveDebug(ginServer *gin.Engine) {
+	if "prod" == util.Mode {
+		// The production environment will no longer register `/debug/pprof/` https://github.com/siyuan-note/siyuan/issues/10152
+		return
+	}
+
 	ginServer.GET("/debug/pprof/", gin.WrapF(pprof.Index))
 	ginServer.GET("/debug/pprof/allocs", gin.WrapF(pprof.Index))
 	ginServer.GET("/debug/pprof/block", gin.WrapF(pprof.Index))
@@ -230,10 +413,6 @@ func serveDebug(ginServer *gin.Engine) {
 
 func serveWebSocket(ginServer *gin.Engine) {
 	util.WebSocketServer.Config.MaxMessageSize = 1024 * 1024 * 8
-	if "docker" == util.Container { // Docker 容器运行时启用 WebSocket 传输压缩
-		util.WebSocketServer.Config.EnableCompression = true
-		util.WebSocketServer.Config.CompressionLevel = 4
-	}
 
 	ginServer.GET("/ws", func(c *gin.Context) {
 		if err := util.WebSocketServer.HandleRequest(c.Writer, c.Request); nil != err {
@@ -242,7 +421,7 @@ func serveWebSocket(ginServer *gin.Engine) {
 	})
 
 	util.WebSocketServer.HandlePong(func(session *melody.Session) {
-		//model.Logger.Debugf("pong")
+		//logging.LogInfof("pong")
 	})
 
 	util.WebSocketServer.HandleConnect(func(s *melody.Session) {
@@ -259,21 +438,27 @@ func serveWebSocket(ginServer *gin.Engine) {
 				if nil == val {
 					authOk = false
 				} else {
-					sess := map[string]interface{}{}
-					err = gulu.JSON.UnmarshalJSON([]byte(val.(string)), &sess)
+					sess := &util.SessionData{}
+					err = gulu.JSON.UnmarshalJSON([]byte(val.(string)), sess)
 					if nil != err {
 						authOk = false
 						logging.LogErrorf("unmarshal cookie failed: %s", err)
 					} else {
-						authOk = sess["AccessAuthCode"].(string) == model.Conf.AccessAuthCode
+						workspaceSess := util.GetWorkspaceSession(sess)
+						authOk = workspaceSess.AccessAuthCode == model.Conf.AccessAuthCode
 					}
 				}
 			}
 		}
 
 		if !authOk {
+			// 用于授权页保持连接，避免非常驻内存内核自动退出 https://github.com/siyuan-note/insider/issues/1099
+			authOk = strings.Contains(s.Request.RequestURI, "/ws?app=siyuan&id=auth")
+		}
+
+		if !authOk {
 			s.CloseWithMsg([]byte("  unauthenticated"))
-			//logging.LogWarnf("closed a unauthenticated session [%s]", util.GetRemoteAddr(s))
+			logging.LogWarnf("closed an unauthenticated session [%s]", util.GetRemoteAddr(s.Request))
 			return
 		}
 
@@ -285,12 +470,12 @@ func serveWebSocket(ginServer *gin.Engine) {
 	util.WebSocketServer.HandleDisconnect(func(s *melody.Session) {
 		util.RemovePushChan(s)
 		//sessionId, _ := s.Get("id")
-		//model.Logger.Debugf("ws [%s] disconnected", sessionId)
+		//logging.LogInfof("ws [%s] disconnected", sessionId)
 	})
 
 	util.WebSocketServer.HandleError(func(s *melody.Session, err error) {
 		//sessionId, _ := s.Get("id")
-		//logging.LogDebugf("ws [%s] failed: %s", sessionId, err)
+		//logging.LogWarnf("ws [%s] failed: %s", sessionId, err)
 	})
 
 	util.WebSocketServer.HandleClose(func(s *melody.Session, i int, str string) error {
@@ -368,8 +553,10 @@ func corsMiddleware() gin.HandlerFunc {
 		c.Header("Access-Control-Allow-Credentials", "true")
 		c.Header("Access-Control-Allow-Headers", "origin, Content-Length, Content-Type, Authorization")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
+		c.Header("Access-Control-Allow-Private-Network", "true")
 
 		if c.Request.Method == "OPTIONS" {
+			c.Header("Access-Control-Max-Age", "600")
 			c.AbortWithStatus(204)
 			return
 		}

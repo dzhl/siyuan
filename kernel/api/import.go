@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -33,6 +33,9 @@ func importSY(c *gin.Context) {
 	ret := gulu.Ret.NewResult()
 	defer c.JSON(200, ret)
 
+	util.PushEndlessProgress(model.Conf.Language(73))
+	defer util.ClearPushProgress(100)
+
 	form, err := c.MultipartForm()
 	if nil != err {
 		logging.LogErrorf("parse import .sy.zip failed: %s", err)
@@ -43,9 +46,9 @@ func importSY(c *gin.Context) {
 
 	files := form.File["file"]
 	if 1 > len(files) {
-		logging.LogErrorf("parse import .sy.zip failed: %s", err)
+		logging.LogErrorf("parse import .sy.zip failed, no file found")
 		ret.Code = -1
-		ret.Msg = err.Error()
+		ret.Msg = "no file found"
 		return
 	}
 	file := files[0]
@@ -96,6 +99,9 @@ func importSY(c *gin.Context) {
 func importData(c *gin.Context) {
 	ret := gulu.Ret.NewResult()
 	defer c.JSON(http.StatusOK, ret)
+
+	util.PushEndlessProgress(model.Conf.Language(73))
+	defer util.ClearPushProgress(100)
 
 	form, err := c.MultipartForm()
 	if nil != err {

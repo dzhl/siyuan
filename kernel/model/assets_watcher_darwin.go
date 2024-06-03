@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -58,7 +58,13 @@ func watchAssets() {
 				}
 
 				// 重新缓存资源文件，以便使用 /资源 搜索
-				cache.LoadAssets()
+				go cache.LoadAssets()
+
+				if watcher.Remove == event.Op {
+					RemoveIndexAssetContent(event.Path)
+				} else {
+					IndexAssetContent(event.Path)
+				}
 			case err, ok := <-assetsWatcher.Error:
 				if !ok {
 					return
