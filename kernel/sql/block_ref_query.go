@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -17,6 +17,7 @@
 package sql
 
 import (
+	"bytes"
 	"database/sql"
 	"sort"
 	"strings"
@@ -25,37 +26,54 @@ import (
 	"github.com/88250/lute/parse"
 	"github.com/emirpasic/gods/sets/hashset"
 	"github.com/siyuan-note/logging"
+	"github.com/siyuan-note/siyuan/kernel/search"
 )
 
-func QueryVirtualRefKeywords(name, alias, anchor, doc bool) (ret []string) {
-	ret, ok := getVirtualRefKeywordsCache()
-	if ok {
-		return ret
+func GetRefDuplicatedDefRootIDs() (ret []string) {
+	rows, err := query("SELECT DISTINCT def_block_root_id FROM `refs` GROUP BY def_block_id, def_block_root_id, block_id HAVING COUNT(*) > 1")
+	if nil != err {
+		logging.LogErrorf("sql query failed: %s", err)
+		return
 	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		rows.Scan(&id)
+		ret = append(ret, id)
+	}
+	return
+}
 
+func QueryVirtualRefKeywords(name, alias, anchor, doc bool, searchIgnoreLines, refSearchIgnoreLines []string) (ret []string) {
 	if name {
-		ret = append(ret, queryNames()...)
+		ret = append(ret, queryNames(searchIgnoreLines)...)
 	}
 	if alias {
-		ret = append(ret, queryAliases()...)
+		ret = append(ret, queryAliases(searchIgnoreLines)...)
 	}
 	if anchor {
-		ret = append(ret, queryRefTexts()...)
+		ret = append(ret, queryRefTexts(refSearchIgnoreLines)...)
 	}
 	if doc {
-		ret = append(ret, queryDocTitles()...)
+		ret = append(ret, queryDocTitles(searchIgnoreLines)...)
 	}
 	ret = gulu.Str.RemoveDuplicatedElem(ret)
 	sort.SliceStable(ret, func(i, j int) bool {
 		return len(ret[i]) >= len(ret[j])
 	})
-	setVirtualRefKeywords(ret)
 	return
 }
 
-func queryRefTexts() (ret []string) {
+func queryRefTexts(refSearchIgnoreLines []string) (ret []string) {
 	ret = []string{}
-	sqlStmt := "SELECT DISTINCT content FROM refs LIMIT 1024"
+	sqlStmt := "SELECT DISTINCT content FROM refs WHERE 1 = 1"
+	buf := bytes.Buffer{}
+	for _, line := range refSearchIgnoreLines {
+		buf.WriteString(" AND ")
+		buf.WriteString(line)
+	}
+	sqlStmt += buf.String()
+	sqlStmt += " LIMIT 10240"
 	rows, err := query(sqlStmt)
 	if nil != err {
 		logging.LogErrorf("sql query failed: %s", sqlStmt, err)
@@ -74,6 +92,28 @@ func queryRefTexts() (ret []string) {
 	}
 	for _, refText := range set.Values() {
 		ret = append(ret, refText.(string))
+	}
+	return
+}
+
+func QueryRefCount(defIDs []string) (ret map[string]int) {
+	ret = map[string]int{}
+	ids := strings.Join(defIDs, "','")
+	ids = "('" + ids + "')"
+	rows, err := query("SELECT def_block_id, COUNT(*) AS ref_cnt FROM refs WHERE def_block_id IN " + ids + " GROUP BY def_block_id")
+	if nil != err {
+		logging.LogErrorf("sql query failed: %s", err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var cnt int
+		if err = rows.Scan(&id, &cnt); nil != err {
+			logging.LogErrorf("query scan field failed: %s", err)
+			return
+		}
+		ret[id] = cnt
 	}
 	return
 }
@@ -134,22 +174,41 @@ func QueryDefRootBlocksByRefRootID(refRootID string) (ret []*Block) {
 	return
 }
 
-func QueryRefRootBlocksByDefRootID(defRootID string) (ret []*Block) {
-	rows, err := query("SELECT * FROM blocks WHERE id IN (SELECT DISTINCT root_id FROM refs WHERE def_block_root_id = ?)", defRootID)
+func QueryRefRootBlocksByDefRootIDs(defRootIDs []string) (ret map[string][]*Block) {
+	ret = map[string][]*Block{}
+
+	stmt := "SELECT r.def_block_root_id, b.* FROM refs AS r, blocks AS b ON r.def_block_root_id IN ('" + strings.Join(defRootIDs, "','") + "')" + " AND b.id = r.root_id"
+	rows, err := query(stmt)
 	if nil != err {
 		logging.LogErrorf("sql query failed: %s", err)
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
-		if block := scanBlockRows(rows); nil != block {
-			ret = append(ret, block)
+		var block Block
+		var defRootID string
+		if err := rows.Scan(&defRootID, &block.ID, &block.ParentID, &block.RootID, &block.Hash, &block.Box, &block.Path, &block.HPath, &block.Name, &block.Alias, &block.Memo, &block.Tag, &block.Content, &block.FContent, &block.Markdown, &block.Length, &block.Type, &block.SubType, &block.IAL, &block.Sort, &block.Created, &block.Updated); nil != err {
+			logging.LogErrorf("query scan field failed: %s\n%s", err, logging.ShortStack())
+			return
+		}
+
+		if nil == ret[defRootID] {
+			ret[defRootID] = []*Block{&block}
+		} else {
+			ret[defRootID] = append(ret[defRootID], &block)
 		}
 	}
 	return
 }
 
-func GetRefText(defBlockID string) string {
+func GetRefText(defBlockID string) (ret string) {
+	ret = getRefText(defBlockID)
+	ret = strings.ReplaceAll(ret, search.SearchMarkLeft, "")
+	ret = strings.ReplaceAll(ret, search.SearchMarkRight, "")
+	return
+}
+
+func getRefText(defBlockID string) string {
 	block := GetBlock(defBlockID)
 	if nil == block {
 		if strings.HasPrefix(defBlockID, "assets") {
@@ -167,6 +226,8 @@ func GetRefText(defBlockID string) string {
 		return block.Content
 	case "query_embed":
 		return "Query Embed Block " + block.Markdown
+	case "av":
+		return "Database " + block.Markdown
 	case "iframe":
 		return "IFrame " + block.Markdown
 	case "tb":
@@ -195,7 +256,11 @@ func QueryBlockDefIDsByRefText(refText string, excludeIDs []string) (ret []strin
 func queryDefIDsByDefText(keyword string, excludeIDs []string) (ret []string) {
 	ret = []string{}
 	notIn := "('" + strings.Join(excludeIDs, "','") + "')"
-	rows, err := query("SELECT DISTINCT(def_block_id) FROM refs WHERE content = ? AND def_block_id NOT IN "+notIn, keyword)
+	q := "SELECT DISTINCT(def_block_id) FROM refs WHERE content LIKE ? AND def_block_id NOT IN " + notIn
+	if caseSensitive {
+		q = "SELECT DISTINCT(def_block_id) FROM refs WHERE content = ? AND def_block_id NOT IN " + notIn
+	}
+	rows, err := query(q, keyword)
 	if nil != err {
 		logging.LogErrorf("sql query failed: %s", err)
 		return
@@ -295,8 +360,22 @@ func QueryRefIDsByDefID(defID string, containChildren bool) (refIDs, refTexts []
 	return
 }
 
-func QueryRefsRecent() (ret []*Ref) {
-	rows, err := query("SELECT * FROM refs GROUP BY def_block_id ORDER BY id desc LIMIT 32")
+func QueryRefsRecent(onlyDoc bool, typeFilter string, ignoreLines []string) (ret []*Ref) {
+	stmt := "SELECT r.* FROM refs AS r, blocks AS b WHERE b.id = r.def_block_id AND b.type IN " + typeFilter
+	if onlyDoc {
+		stmt = "SELECT r.* FROM refs AS r, blocks AS b WHERE b.id = r.def_block_id AND b.type = 'd'"
+	}
+	if 0 < len(ignoreLines) {
+		// Support ignore search results https://github.com/siyuan-note/siyuan/issues/10089
+		buf := bytes.Buffer{}
+		for _, line := range ignoreLines {
+			buf.WriteString(" AND ")
+			buf.WriteString(line)
+		}
+		stmt += buf.String()
+	}
+	stmt += " GROUP BY r.def_block_id ORDER BY r.id DESC LIMIT 32"
+	rows, err := query(stmt)
 	if nil != err {
 		logging.LogErrorf("sql query failed: %s", err)
 		return
