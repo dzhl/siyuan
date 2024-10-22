@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/siyuan-note/filelock"
 	"github.com/siyuan-note/logging"
 	"github.com/siyuan-note/siyuan/kernel/util"
 )
@@ -33,32 +34,64 @@ type Asset struct {
 	Updated int64  `json:"updated"`
 }
 
-var Assets = map[string]*Asset{}
+var assetsCache = map[string]*Asset{}
 var assetsLock = sync.Mutex{}
 
+func GetAssets() (ret map[string]*Asset) {
+	assetsLock.Lock()
+	defer assetsLock.Unlock()
+
+	ret = map[string]*Asset{}
+	for k, v := range assetsCache {
+		ret[k] = v
+	}
+	return
+}
+
+func RemoveAsset(path string) {
+	assetsLock.Lock()
+	defer assetsLock.Unlock()
+
+	delete(assetsCache, path)
+}
+
+func ExistAsset(path string) (ret bool) {
+	assetsLock.Lock()
+	defer assetsLock.Unlock()
+
+	_, ret = assetsCache[path]
+	return
+}
+
 func LoadAssets() {
+	defer logging.Recover()
+
 	start := time.Now()
 	assetsLock.Lock()
 	defer assetsLock.Unlock()
 
-	assets := filepath.Join(util.DataDir, "assets")
-	filepath.Walk(assets, func(path string, info fs.FileInfo, err error) error {
+	assetsCache = map[string]*Asset{}
+	assets := util.GetDataAssetsAbsPath()
+	filelock.Walk(assets, func(path string, info fs.FileInfo, err error) error {
+		if nil == info {
+			return err
+		}
 		if info.IsDir() {
 			if strings.HasPrefix(info.Name(), ".") {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if strings.HasSuffix(info.Name(), ".sya") || strings.HasPrefix(info.Name(), ".") {
+		if strings.HasSuffix(info.Name(), ".sya") || strings.HasPrefix(info.Name(), ".") || filelock.IsHidden(path) {
 			return nil
 		}
 
 		hName := util.RemoveID(info.Name())
-		path = filepath.ToSlash(strings.TrimPrefix(path, util.DataDir))[1:]
-		Assets[path] = &Asset{
+		path = "assets" + filepath.ToSlash(strings.TrimPrefix(path, assets))
+		assetsCache[path] = &Asset{
 			HName:   hName,
 			Path:    path,
-			Updated: info.ModTime().UnixMilli(),
+			Updated: info.ModTime().Unix(),
 		}
 		return nil
 	})
