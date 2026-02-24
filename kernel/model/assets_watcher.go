@@ -1,4 +1,4 @@
-// SiYuan - Build Your Eternal Digital Garden
+// SiYuan - Refactor your thinking
 // Copyright (c) 2020-present, b3log.org
 //
 // This program is free software: you can redistribute it and/or modify
@@ -19,9 +19,11 @@
 package model
 
 import (
+	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/88250/gulu"
 	"github.com/fsnotify/fsnotify"
 	"github.com/siyuan-note/logging"
 	"github.com/siyuan-note/siyuan/kernel/cache"
@@ -31,7 +33,7 @@ import (
 var assetsWatcher *fsnotify.Watcher
 
 func WatchAssets() {
-	if "android" == util.Container || "ios" == util.Container {
+	if !isFileWatcherAvailable() {
 		return
 	}
 
@@ -47,7 +49,7 @@ func watchAssets() {
 	}
 
 	var err error
-	if assetsWatcher, err = fsnotify.NewWatcher(); nil != err {
+	if assetsWatcher, err = fsnotify.NewWatcher(); err != nil {
 		logging.LogErrorf("add assets watcher for folder [%s] failed: %s", assetsDir, err)
 		return
 	}
@@ -79,15 +81,24 @@ func watchAssets() {
 			case <-timer.C:
 				//logging.LogInfof("assets changed: %s", lastEvent)
 				if lastEvent.Op&fsnotify.Write == fsnotify.Write {
-					// 外部修改已有资源文件后纳入云端同步 https://github.com/siyuan-note/siyuan/issues/4694
 					IncSync()
 				}
 
 				// 重新缓存资源文件，以便使用 /资源 搜索
-				cache.LoadAssets()
+				go cache.LoadAssets()
+
+				if lastEvent.Op&fsnotify.Remove == fsnotify.Remove {
+					HandleAssetsRemoveEvent(lastEvent.Name)
+				} else {
+					HandleAssetsChangeEvent(lastEvent.Name)
+				}
 			}
 		}
 	}()
+
+	if !gulu.File.IsDir(assetsDir) {
+		os.MkdirAll(assetsDir, 0755)
+	}
 
 	if err = assetsWatcher.Add(assetsDir); err != nil {
 		logging.LogErrorf("add assets watcher for folder [%s] failed: %s", assetsDir, err)
